@@ -250,7 +250,7 @@ services:
             "collect-men": "Collect Men",
             "dodge": "Dodge",
             "dodge3d": "Dodge 3D",
-            "example-quiz": "Example Quiz",
+            "example-quiz": "Quiz",
             "glass-bridge": "Glass Bridge",
         }
 
