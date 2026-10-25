@@ -298,7 +298,7 @@ services:
         asyncio.run(main())
 
   frontend:
-    image: ghcr.io/brain-gaim/frontend:0.2.27
+    image: ghcr.io/brain-gaim/frontend:0.2.28
     restart: unless-stopped
     depends_on:
       backend:
