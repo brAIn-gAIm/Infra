@@ -150,11 +150,12 @@ services:
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?encrypts stored keys; never change it after first start}
       DATABASE_URL: postgresql://braingain:${POSTGRES_PASSWORD}@postgres:5432/litellm
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:4000/health/liveliness >/dev/null || exit 1"]
+      # The image has no curl; the first start also runs Prisma migrations, hence the long grace.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 30s
+      start_period: 120s
 
   # Registers the backend's budgeted virtual key (LITELLM_BACKEND_KEY) once; later runs see it
   # already exists. The backend never gets the Anthropic key or the master key.
