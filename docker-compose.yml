@@ -230,6 +230,8 @@ services:
       SEED_USER: ${SEED_USER:-braingain}
       SEED_PASSWORD: ${SEED_PASSWORD:?password of the seeded owner user}
       GAMES_TARBALL_URL: ${GAMES_TARBALL_URL:-https://codeload.github.com/brAIn-gAIm/Backend/tar.gz/main}
+      # Game directories (backend/games/<dir>) not to seed, comma-separated.
+      SKIP_GAMES: ${SKIP_GAMES:-dodge,dodge3d}
     command:
       - python
       - -c
@@ -256,6 +258,7 @@ services:
             username = os.environ["SEED_USER"]
             password = os.environ["SEED_PASSWORD"]
             tarball_url = os.environ["GAMES_TARBALL_URL"]
+            skip = {name.strip() for name in os.environ.get("SKIP_GAMES", "").split(",") if name.strip()}
 
             print(f"Fetching games from {tarball_url} ...")
             with urllib.request.urlopen(tarball_url, timeout=60) as resp:
@@ -279,6 +282,9 @@ services:
                         print(f"Created seed owner user: {username!r}")
 
                     for game_dir in games_dirs:
+                        if game_dir.name in skip:
+                            print(f"Skipping {game_dir.name}")
+                            continue
                         if not (game_dir / "game.js").is_file() or not (game_dir / "config.json").is_file():
                             continue
                         title = TITLES.get(game_dir.name, game_dir.name.replace("-", " ").title())
