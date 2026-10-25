@@ -56,6 +56,8 @@ services:
         VOICE: en_US-hfc_female-medium
     image: braingain/piper:1.8.0-en_US-hfc_female-medium
     restart: unless-stopped
+    # Python as PID 1 ignores SIGTERM; tini forwards it so stops don't end in SIGKILL (137).
+    init: true
 
   cdn:
     image: ghcr.io/brain-gaim/cdn:0.0.8
