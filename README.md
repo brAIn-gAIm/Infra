@@ -2,7 +2,44 @@
 
 Docker Compose configurations for infrastructure and full local deployment. All stacks attach to the shared `braingain` bridge network so application containers (`backend`, `litellm`, `cdn`, `frontend`, `seed`) can reach them by container name.
 
-## Quick Start (Full Local Stack)
+## Dokploy Deployment (branch `deploy/dokploy`)
+
+On this branch the root `docker-compose.yml` is the production stack for Dokploy, served at
+`https://braingain.joachimkern.de`: `postgres`, `rustfs` + `s3-init`, `piper`, `cdn`, `litellm`
+(+ oneshots `litellm-db-init`, `litellm-key-init`), `backend`, `frontend`, `seed`. `llama` and
+`glances` are not deployed. No service publishes a host port; Traefik routes only to `frontend`,
+whose nginx proxies `/api/` → `backend:8000` and `/cdn/` → `cdn:8080`, so the frontend needs no
+configuration. Secrets come from the environment (`.env.example`).
+
+The game generator runs with `LLM_PROVIDER=litellm`: the backend calls the LiteLLM proxy at
+`http://litellm:4000` with the alias `smart` and its own budgeted virtual key
+(`LITELLM_BACKEND_KEY`, registered by `litellm-key-init`); the proxy routes to Anthropic
+(`claude-haiku-5-5`), keeps spend in its own `litellm` database (created by `litellm-db-init`),
+never logs prompts and stops at a 50 USD / 30 days cap.
+
+Setup (once):
+
+1. DNS: `A` record `braingain.joachimkern.de` → the Dokploy host.
+2. Dokploy → project → *Create Service → Compose*; source `brAIn-gAIm/Infra`, branch
+   `deploy/dokploy`, compose path `./docker-compose.yml`.
+3. *Environment*: paste `.env.example` and replace every value.
+4. *Domains*: host `braingain.joachimkern.de`, service `frontend`, port `80`, path `/`,
+   HTTPS with Let's Encrypt.
+5. *Advanced*: enable *Isolated Deployment*, so Traefik joins this stack's network and
+   names like `backend` or `cdn` cannot collide with other apps on `dokploy-network`.
+6. Deploy. Set a monthly spend limit on the Anthropic workspace as a backstop.
+
+Check the LLM route from the backend container:
+
+```bash
+curl -s http://litellm:4000/v1/chat/completions -H "Authorization: Bearer $LLM_API_KEY" \
+  -H 'Content-Type: application/json' -d '{"model": "smart", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+The backend uses `CDN_BASE_URL=${PUBLIC_URL}/cdn` for browser links *and* for its own
+uploads/downloads, so it must be able to reach the public URL from inside the container.
+
+## Quick Start (Full Local Stack, `main`)
 
 Start the entire prototype (`postgres`, `rustfs`, `s3-init`, `piper`, `llama`, `glances`, `cdn`, `backend`, `frontend`, and the oneshot `seed` container that registers a default `braingain` user and seeds all games from `github.com/brAIn-gAIm/Backend`):
 

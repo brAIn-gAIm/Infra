@@ -1,13 +1,16 @@
+# Production stack for Dokploy (branch deploy/dokploy), served at ${PUBLIC_URL}.
+# Only `frontend` is routed by Traefik (Dokploy → Domains); its nginx proxies /api → backend
+# and /cdn → cdn. Nothing else publishes a port. Secrets come from the Dokploy Environment tab
+# (see .env.example).
+x-database-url: &database-url postgresql://braingain:${POSTGRES_PASSWORD}@postgres:5432/braingain
+
 services:
   postgres:
     image: postgres:18.6-alpine3.24
-    container_name: postgres
     restart: unless-stopped
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_USER: braingain
-      POSTGRES_PASSWORD: braingain
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?database password (URL-safe characters only)}
       POSTGRES_DB: braingain
     volumes:
       - postgres_data:/var/lib/postgresql
@@ -19,30 +22,24 @@ services:
 
   rustfs:
     image: rustfs/rustfs:1.0.3
-    container_name: rustfs
     restart: unless-stopped
-    ports:
-      - "9000:9000"
-      - "9001:9001"
     environment:
-      RUSTFS_ACCESS_KEY: braingain
-      RUSTFS_SECRET_KEY: braingain-secret
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?S3 access key for rustfs}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?S3 secret key for rustfs}
       RUSTFS_ADDRESS: ":9000"
-      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
-      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ENABLE: "false"
       RUSTFS_VOLUMES: "/data"
     volumes:
       - rustfs_data:/data
 
   s3-init:
-    image: amazon/aws-cli:latest
-    container_name: s3-init
+    image: amazon/aws-cli:2.38.4
     restart: "no"
     depends_on:
       - rustfs
     environment:
-      AWS_ACCESS_KEY_ID: braingain
-      AWS_SECRET_ACCESS_KEY: braingain-secret
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
       AWS_DEFAULT_REGION: us-east-1
     entrypoint: ["sh", "-c"]
     command:
@@ -58,47 +55,11 @@ services:
       args:
         VOICE: en_US-hfc_female-medium
     image: braingain/piper:1.8.0-en_US-hfc_female-medium
-    container_name: piper
     restart: unless-stopped
-    ports:
-      - "5000:5000"
-
-  llama:
-    image: ghcr.io/ggml-org/llama.cpp:server-b11515
-    container_name: llama
-    restart: unless-stopped
-    ports:
-      - "8082:8080"
-    environment:
-      LLAMA_ARG_HF_REPO: unsloth/Qwen3-1.7B-GGUF:Q4_K_M
-      LLAMA_CACHE: /models
-      LLAMA_ARG_CTX_SIZE: 8192
-      LLAMA_ARG_N_PARALLEL: 1
-      LLAMA_ARG_THREADS: 3
-      LLAMA_ARG_REASONING: "off"
-    volumes:
-      - llama_models:/models
-    mem_limit: 5g
-
-  glances:
-    image: nicolargo/glances:latest-full
-    container_name: glances
-    restart: unless-stopped
-    pid: host
-    ports:
-      - "61208:61208"
-    environment:
-      GLANCES_OPT: "-w"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
 
   cdn:
-    image: ghcr.io/brain-gaim/cdn:latest
-    container_name: cdn
+    image: ghcr.io/brain-gaim/cdn:0.0.8
     restart: unless-stopped
-    ports:
-      - "8081:8080"
-      - "8444:8443"
     depends_on:
       rustfs:
         condition: service_started
@@ -106,15 +67,15 @@ services:
         condition: service_completed_successfully
     environment:
       PORT: "8080"
-      TLS_PORT: "8443"
-      TLS_ENABLED: "true"
-      CDN_BASE_URL: ${CDN_BASE_URL:-http://localhost:8081}
+      # Traefik terminates TLS in front of the frontend's /cdn/ proxy.
+      TLS_ENABLED: "false"
+      CDN_BASE_URL: ${PUBLIC_URL:?public URL without trailing slash, e.g. https://braingain.joachimkern.de}/cdn
       MAX_UPLOAD_SIZE_MB: "500"
       S3_ENDPOINT: "http://rustfs:9000"
       S3_REGION: "us-east-1"
       S3_BUCKET: "braingain"
-      S3_ACCESS_KEY_ID: "braingain"
-      S3_SECRET_ACCESS_KEY: "braingain-secret"
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
       S3_USE_PATH_STYLE: "true"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null || exit 1"]
@@ -122,12 +83,108 @@ services:
       timeout: 3s
       retries: 10
 
-  backend:
-    image: ghcr.io/brain-gaim/backend:latest
-    container_name: backend
+  # LiteLLM's own database on the same Postgres; idempotent, so it also works on an existing volume.
+  litellm-db-init:
+    image: postgres:18.6-alpine3.24
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: braingain
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: braingain
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'litellm'" | grep -q 1
+        || createdb litellm
+
+  # LLM proxy (Backend#44): routes the backend's model aliases to Anthropic and enforces spend
+  # budgets. Reachable only inside the stack network, at http://litellm:4000.
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.106.3
     restart: unless-stopped
-    ports:
-      - "3000:8000"
+    depends_on:
+      litellm-db-init:
+        condition: service_completed_successfully
+    # Config inline, as in backend/docker-compose.yaml, so the stack is a single file.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - printf '%s\n' "$$LITELLM_CONFIG" > /tmp/config.yaml && exec litellm --config /tmp/config.yaml --port 4000
+    environment:
+      LITELLM_CONFIG: |
+        # The backend asks for an alias, the proxy picks the Anthropic model, tracks spend per
+        # key and stops at the budgets below. Secrets come from the environment.
+        model_list:
+          - model_name: smart # writes games and round inputs
+            litellm_params:
+              model: anthropic/claude-haiku-5-5
+              api_key: os.environ/ANTHROPIC_API_KEY
+          - model_name: fast # cheaper fallback
+            litellm_params:
+              model: anthropic/claude-haiku-5-5
+              api_key: os.environ/ANTHROPIC_API_KEY
+
+        router_settings:
+          fallbacks: [{ "smart": ["fast"] }]
+          num_retries: 1
+
+        litellm_settings:
+          # Drop request parameters a model does not support instead of failing.
+          drop_params: true
+          # Prompts contain users' documents: keep spend and token counts, never message content.
+          turn_off_message_logging: true
+          # Hard cap for the whole proxy, on top of each key's own budget.
+          max_budget: 50 # USD
+          budget_duration: 30d
+
+        general_settings:
+          master_key: os.environ/LITELLM_MASTER_KEY
+          database_url: os.environ/DATABASE_URL
+          store_prompts_in_spend_logs: false
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Anthropic API key}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?admin key for the proxy, starts with sk-}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?encrypts stored keys; never change it after first start}
+      DATABASE_URL: postgresql://braingain:${POSTGRES_PASSWORD}@postgres:5432/litellm
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:4000/health/liveliness >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # Registers the backend's budgeted virtual key (LITELLM_BACKEND_KEY) once; later runs see it
+  # already exists. The backend never gets the Anthropic key or the master key.
+  litellm-key-init:
+    image: curlimages/curl:8.22.0
+    restart: "no"
+    depends_on:
+      litellm:
+        condition: service_healthy
+    environment:
+      MASTER_KEY: ${LITELLM_MASTER_KEY}
+      BACKEND_KEY: ${LITELLM_BACKEND_KEY:?virtual key for the backend, starts with sk-}
+      BACKEND_BUDGET: ${LITELLM_BACKEND_BUDGET:-20}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        auth="Authorization: Bearer $$MASTER_KEY"
+        if curl -fs -o /dev/null -H "$$auth" "http://litellm:4000/key/info?key=$$BACKEND_KEY"; then
+          echo "backend key exists"
+        else
+          curl -fsS -o /dev/null -X POST http://litellm:4000/key/generate \
+            -H "$$auth" -H 'Content-Type: application/json' \
+            -d "{\"key\": \"$$BACKEND_KEY\", \"key_alias\": \"backend\", \"max_budget\": $$BACKEND_BUDGET, \"budget_duration\": \"30d\"}"
+          echo "backend key created"
+        fi
+
+  backend:
+    image: ghcr.io/brain-gaim/backend:0.0.32
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
@@ -135,40 +192,19 @@ services:
         condition: service_healthy
       piper:
         condition: service_started
-      llama:
-        condition: service_started
+      litellm-key-init:
+        condition: service_completed_successfully
+    # The image's default command runs `alembic upgrade head`, then serves on port 8000.
     environment:
-      DATABASE_URL: postgresql://braingain:braingain@postgres:5432/braingain
-      JWT_SECRET: ${JWT_SECRET:-change-me-to-at-least-32-characters-for-local-dev}
-      CDN_BASE_URL: ${CDN_BASE_URL:-http://localhost:8081}
+      DATABASE_URL: *database-url
+      JWT_SECRET: ${JWT_SECRET:?at least 32 characters}
+      # Used for browser links and for the backend's own uploads/downloads (via the public URL).
+      CDN_BASE_URL: ${PUBLIC_URL}/cdn
       TTS_URL: http://piper:5000
-      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://llama:8080/v1}
-      LLM_MODEL: ${LLM_MODEL:-unsloth/Qwen3-1.7B-GGUF:Q4_K_M}
-      LLM_API_KEY: ${LLM_API_KEY:-}
-    command:
-      - sh
-      - -c
-      - |
-        python -c "
-        import asyncio
-        async def pipe(r, w):
-            try:
-                while d := await r.read(65536):
-                    w.write(d)
-                    await w.drain()
-            finally:
-                w.close()
-        async def handle(cr, cw):
-            sr, sw = await asyncio.open_connection('cdn', 8080)
-            await asyncio.gather(pipe(cr, sw), pipe(sr, cw))
-        async def main():
-            async with await asyncio.start_server(handle, '127.0.0.1', 8081) as s:
-                await s.serve_forever()
-        asyncio.run(main())
-        " &
-        alembic upgrade head &&
-        exec fastapi run app/main.py --host 0.0.0.0 --port 8000
+      LLM_PROVIDER: litellm
+      LLM_BASE_URL: http://litellm:4000
+      LLM_MODEL: smart
+      LLM_API_KEY: ${LITELLM_BACKEND_KEY}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -177,8 +213,7 @@ services:
       start_period: 10s
 
   seed:
-    image: ghcr.io/brain-gaim/backend:latest
-    container_name: seed
+    image: ghcr.io/brain-gaim/backend:0.0.32
     restart: "no"
     depends_on:
       backend:
@@ -186,11 +221,11 @@ services:
       cdn:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://braingain:braingain@postgres:5432/braingain
-      JWT_SECRET: ${JWT_SECRET:-change-me-to-at-least-32-characters-for-local-dev}
+      DATABASE_URL: *database-url
+      JWT_SECRET: ${JWT_SECRET}
       CDN_BASE_URL: http://cdn:8080
       SEED_USER: ${SEED_USER:-braingain}
-      SEED_PASSWORD: ${SEED_PASSWORD:-braingain}
+      SEED_PASSWORD: ${SEED_PASSWORD:?password of the seeded owner user}
       GAMES_TARBALL_URL: ${GAMES_TARBALL_URL:-https://codeload.github.com/brAIn-gAIm/Backend/tar.gz/main}
     command:
       - python
@@ -260,11 +295,8 @@ services:
         asyncio.run(main())
 
   frontend:
-    image: ghcr.io/brain-gaim/frontend:latest
-    container_name: frontend
+    image: ghcr.io/brain-gaim/frontend:0.2.27
     restart: unless-stopped
-    ports:
-      - "8080:80"
     depends_on:
       backend:
         condition: service_healthy
@@ -274,7 +306,6 @@ services:
 volumes:
   postgres_data:
   rustfs_data:
-  llama_models:
 
 networks:
   default:

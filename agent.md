@@ -29,3 +29,11 @@ docker compose -f glances/docker-compose.yml up -d
 - Keep container names, ports, and the `braingain` network name consistent: `Backend`, `CDN`, and `Frontend` production stacks depend on `postgres`, `rustfs`, `piper`, and `llama` resolving on the `braingain` network.
 - Host port `8080` is used by `frontend` and `8081` by `cdn`; `llama` publishes on host port `8082` (`8082:8080`).
 - When changing the Piper voice in `piper/`, update `VOICE` in `piper/Dockerfile` and `piper/docker-compose.yml` and rebuild `braingain/piper:1.8.0`.
+
+## Branch `deploy/dokploy`
+
+The root `docker-compose.yml` here is the Dokploy production stack (see README → Dokploy
+Deployment): no host ports, no `container_name`, pinned images, secrets from `.env`
+(`.env.example`), `litellm` → Anthropic active for the backend, `llama` and `glances` removed.
+Only `frontend` gets a Traefik domain. Keep it in sync with `main` by merging `main` in, not
+the other way round.
